@@ -23,10 +23,10 @@ class DAGMM:
     SCALER_FILENAME = "DAGMM_scaler"
 
     def __init__(self, comp_hiddens, comp_activation,
-            est_hiddens, est_activation, est_dropout_ratio=0.5,
-            minibatch_size=1024, epoch_size=100,
-            learning_rate=0.0001, lambda1=0.1, lambda2=0.0001,
-            normalize=True, random_seed=123):
+                 est_hiddens, est_activation, est_dropout_ratio=0.5,
+                 minibatch_size=1024, epoch_size=100,
+                 learning_rate=0.0001, lambda1=0.1, lambda2=0.0001,
+                 normalize=True, random_seed=123, earlystopping=5):
         """
         Parameters
         ----------
@@ -64,6 +64,8 @@ class DAGMM:
             by default, input data is normalized.
         random_seed : int (optional)
             random seed used when fit() is called.
+        earlystopping : int (optional)
+            early stop when loss is not decreasd within N times
         """
         self.comp_net = CompressionNet(comp_hiddens, comp_activation)
         self.est_net = EstimationNet(est_hiddens, est_activation)
@@ -84,6 +86,11 @@ class DAGMM:
 
         self.graph = None
         self.sess = None
+        self.loss_arr = []
+
+        self.elapsed_t = None
+
+        self.earlystopping = earlystopping
 
     def __del__(self):
         if self.sess is not None:
@@ -114,7 +121,7 @@ class DAGMM:
             self.drop = drop = tf.placeholder(dtype=tf.float32, shape=[])
 
             # Build graph
-            z, x_dash  = self.comp_net.inference(input)
+            z, x_dash = self.comp_net.inference(input)
             gamma = self.est_net.inference(z, drop)
             self.gmm.fit(z, gamma)
             energy = self.gmm.energy(z)
@@ -123,8 +130,8 @@ class DAGMM:
 
             # Loss function
             loss = (self.comp_net.reconstruction_error(input, x_dash) +
-                self.lambda1 * tf.reduce_mean(energy) +
-                self.lambda2 * self.gmm.cov_diag_loss())
+                    self.lambda1 * tf.reduce_mean(energy) +
+                    self.lambda2 * self.gmm.cov_diag_loss())
 
             # Minimizer
             minimizer = tf.train.AdamOptimizer(self.learning_rate).minimize(loss)
@@ -134,13 +141,17 @@ class DAGMM:
 
             # Create tensorflow session and initilize
             init = tf.global_variables_initializer()
-
             self.sess = tf.Session(graph=graph)
             self.sess.run(init)
 
             # Training
             idx = np.arange(x.shape[0])
             np.random.shuffle(idx)
+
+            latest_loss = None
+            min_loss = None
+            epoch_of_min_loss = None
+            start_t = time.time()
 
             for epoch in range(self.epoch_size):
                 for batch in range(n_batch):
@@ -149,21 +160,39 @@ class DAGMM:
                     x_batch = x[idx[i_start:i_end]]
 
                     self.sess.run(minimizer, feed_dict={
-                        input:x_batch, drop:self.est_dropout_ratio})
+                        input: x_batch, drop: self.est_dropout_ratio})
 
                 if (epoch + 1) % 100 == 0:
-                    loss_val = self.sess.run(loss, feed_dict={input:x, drop:0})
-                    print(f" epoch {epoch+1}/{self.epoch_size} : loss = {loss_val:.3f}")
+                    loss_val = self.sess.run(loss, feed_dict={input: x, drop: 0})
+                    loss_diff = 0 if latest_loss is None else loss_val - latest_loss
+                    print(f" epoch {epoch + 1}/{self.epoch_size} : loss = {loss_val:.3f} ({loss_diff:.3f})")
+                    latest_loss = loss_val
+                    self.loss_arr.append([epoch + 1, loss_val, loss_diff])
+
+                    # Early stopping
+                    if latest_loss < 0:
+                        print('early stopping... by reached zero')
+                    if min_loss is None or min_loss > latest_loss:
+                        min_loss = latest_loss
+                        epoch_of_min_loss = int(epoch)
+                    if min_loss < latest_loss and int(
+                            ((int(epoch) + 1) - (epoch_of_min_loss + 1)) / 100) >= self.earlystopping:
+                        print('early stopping...')
+                        break
 
             # Fix GMM parameter
             fix = self.gmm.fix_op()
-            self.sess.run(fix, feed_dict={input:x, drop:0})
+            self.sess.run(fix, feed_dict={input: x, drop: 0})
             self.energy = self.gmm.energy(z)
 
             tf.add_to_collection("save", self.input)
             tf.add_to_collection("save", self.energy)
 
             self.saver = tf.train.Saver()
+
+            end_t = time.time()
+            self.elapsed_t = end_t - start_t
+            print('Elapsed seconds : %f' % self.elapsed_t)
 
     def predict(self, x):
         """ Calculate anormaly scores (sample energy) on samples in X.
@@ -185,7 +214,7 @@ class DAGMM:
         if self.normalize:
             x = self.scaler.transform(x)
 
-        energies = self.sess.run(self.energy, feed_dict={self.input:x})
+        energies = self.sess.run(self.energy, feed_dict={self.input: x})
         return energies
 
     def save(self, fdir):
@@ -237,3 +266,4 @@ class DAGMM:
         if self.normalize:
             scaler_path = join(fdir, self.SCALER_FILENAME)
             self.scaler = joblib.load(scaler_path)
+
